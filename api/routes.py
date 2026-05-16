@@ -72,11 +72,18 @@ async def get_price(
         features = feature_store.get(request_body.product_id)
 
         if features is None:
-            raise HTTPException(
-                status_code=404,
-                detail=f"No features found for product {request_body.product_id}. "
-                       "Run the feature pipeline first."
-            )
+            from data.real_ingestion import generate_real_sales_data, generate_real_inventory_data, generate_real_competitor_data
+            from data.catalogue import PRODUCT_MAP
+            if request_body.product_id not in PRODUCT_MAP:
+                raise HTTPException(status_code=404, detail=f"Product {request_body.product_id} not found.")
+            sales_df = generate_real_sales_data(days_back=30)
+            inventory_df = generate_real_inventory_data()
+            competitor_df = generate_real_competitor_data()
+            pipeline = FeaturePipeline(sales_df, inventory_df, competitor_df)
+            features = pipeline.build_features(request_body.product_id)
+            product = PRODUCT_MAP[request_body.product_id]
+            features.base_price = product.base_price
+            features.category = product.category
 
         # Override inventory if caller provided it
         if request_body.inventory is not None:
