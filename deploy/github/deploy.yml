@@ -1,0 +1,183 @@
+# deploy/github/deploy.yml
+# Copy this file to .github/workflows/deploy.yml in your repo.
+#
+# Required GitHub Secrets:
+#   AWS_ACCOUNT_ID        — your 12-digit AWS account number
+#   AWS_REGION            — e.g. us-east-1
+#   ECR_API_REPO          — ECR repo name for the API (from terraform output)
+#   ECR_WORKER_REPO       — ECR repo name for the worker
+#   ECS_CLUSTER           — ECS cluster name (from terraform output)
+#   ECS_API_SERVICE       — ECS service name
+#   S3_MODELS_BUCKET      — S3 bucket for model artifacts
+#   TF_STATE_BUCKET       — S3 bucket holding Terraform state
+
+name: Deploy — Dynamic Pricing Engine
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  AWS_REGION:   ${{ secrets.AWS_REGION }}
+  ECR_API_REPO: ${{ secrets.AWS_ACCOUNT_ID }}.dkr.ecr.${{ secrets.AWS_REGION }}.amazonaws.com/${{ secrets.ECR_API_REPO }}
+
+permissions:
+  id-token: write   # Required for OIDC auth to AWS
+  contents: read
+
+jobs:
+  # ── 1. Test ──────────────────────────────────────────────────────────────────
+  test:
+    name: Run test suite
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run tests
+        run: pytest tests/ -v --tb=short --cov=. --cov-report=xml
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        with:
+          file: ./coverage.xml
+        continue-on-error: true
+
+  # ── 2. Build + push Docker image ─────────────────────────────────────────────
+  build:
+    name: Build and push to ECR
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      image: ${{ steps.meta.outputs.tags }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-deploy
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Docker image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.ECR_API_REPO }}
+          tags: |
+            type=sha,prefix=sha-
+            type=raw,value=latest
+
+      - name: Build and push API image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          cache-from: type=registry,ref=${{ env.ECR_API_REPO }}:latest
+          cache-to:   type=inline
+
+  # ── 3. Deploy to ECS ──────────────────────────────────────────────────────────
+  deploy:
+    name: Deploy to ECS Fargate
+    runs-on: ubuntu-latest
+    needs: build
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-deploy
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Download current ECS task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition pricing-engine-api \
+            --query taskDefinition \
+            > task-def.json
+
+      - name: Update image in task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name:  pricing-engine-api
+          image:           ${{ env.ECR_API_REPO }}:sha-${{ github.sha }}
+
+      - name: Deploy to ECS service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service:         ${{ secrets.ECS_API_SERVICE }}
+          cluster:         ${{ secrets.ECS_CLUSTER }}
+          wait-for-service-stability: true
+          # If the new tasks fail health checks, automatically roll back
+          codedeploy-appspec: |
+            version: 0.0
+            Resources:
+              - TargetService:
+                  Type: AWS::ECS::Service
+                  Properties:
+                    TaskDefinition: <TASK_DEFINITION>
+                    LoadBalancerInfo:
+                      ContainerName: pricing-engine-api
+                      ContainerPort: 8000
+
+  # ── 4. Smoke test after deploy ────────────────────────────────────────────────
+  smoke-test:
+    name: Post-deploy smoke test
+    runs-on: ubuntu-latest
+    needs: deploy
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::${{ secrets.AWS_ACCOUNT_ID }}:role/github-actions-deploy
+          aws-region:     ${{ env.AWS_REGION }}
+
+      - name: Get ALB endpoint
+        id: alb
+        run: |
+          DNS=$(aws elbv2 describe-load-balancers \
+            --names pricing-engine-alb \
+            --query 'LoadBalancers[0].DNSName' \
+            --output text)
+          echo "url=https://${DNS}" >> "$GITHUB_OUTPUT"
+
+      - name: Health check
+        run: |
+          curl -sf ${{ steps.alb.outputs.url }}/api/v1/health | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); assert d['status']=='ok'"
+
+      - name: Pricing endpoint smoke test
+        run: |
+          curl -sf -X POST ${{ steps.alb.outputs.url }}/api/v1/price \
+            -H "Content-Type: application/json" \
+            -d '{"product_id":"SKU-001"}' | \
+            python3 -c "import sys,json; d=json.load(sys.stdin); assert 'recommended_price' in d"
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "Smoke test failed — check ECS logs in CloudWatch" && exit 1
