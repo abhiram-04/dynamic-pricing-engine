@@ -10,7 +10,7 @@ A production-grade AI pricing engine for Indian e-commerce combining:
 
 ## 🎥 Demo Video
 
-[Click here to watch the demo](https://your-demo-link-here)
+
 
 ## 🌐 Live Demo
 
